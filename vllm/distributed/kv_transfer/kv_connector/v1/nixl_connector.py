@@ -46,7 +46,7 @@ logger = init_logger(__name__)
 
 # Lazy import nixl_wrapper to avoid loading nixl_bindings if nixl is not used
 try:
-    from nixl._api import nixl_agent as NixlWrapper
+    from nixl._api import nixl_agent_config, nixl_agent as NixlWrapper
     logger.info("NIXL is available")
 except ImportError:
     logger.warning("NIXL is not available")
@@ -360,8 +360,10 @@ class NixlConnectorWorker:
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
 
+        # Config for nixl
+        config = nixl_agent_config(device_idx=get_tensor_model_parallel_rank(), backends=["UCCL"])
         # Agent.
-        self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), None)
+        self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), config)
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
         self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
 
@@ -880,6 +882,8 @@ class NixlConnectorWorker:
             for handle, _xfer_stime in handles:
                 xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 if xfer_state == "DONE":
+                    total_transfer_time = time.perf_counter() - _xfer_stime
+                    print(f"[NIXL_TIMING] READ completion latency: {total_transfer_time*1000:.3f} ms")
                     self.nixl_wrapper.release_xfer_handle(handle)
                 elif xfer_state == "PROC":
                     in_progress = True
@@ -1012,6 +1016,7 @@ class NixlConnectorWorker:
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
         # Prepare transfer with Nixl.
+        prep_start_time = time.perf_counter()
         handle = self.nixl_wrapper.make_prepped_xfer(
             "READ",
             local_xfer_side_handle,
@@ -1020,14 +1025,21 @@ class NixlConnectorWorker:
             remote_block_descs_ids,
             notif_msg=notif_id,
         )
+        prep_end_time = time.perf_counter()
+        prep_latency = prep_end_time - prep_start_time
+        print(f"[NIXL_TIMING] make_prepped_xfer latency: {prep_latency*1000:.3f} ms")
 
         # Begin async xfer.
+        transfer_start_time = time.perf_counter()
         self.nixl_wrapper.transfer(handle)
+        transfer_end_time = time.perf_counter()
+        transfer_latency = transfer_end_time - transfer_start_time
+        print(f"[NIXL_TIMING] READ launch latency: {transfer_latency*1000:.3f} ms")
 
         # Use handle to check completion in future step().
         # TODO (NickLucche) surface xfer elapsed time
         self._recving_transfers[request_id].append(
-            (handle, time.perf_counter()))
+            (handle, transfer_end_time))
 
     def _get_block_descs_ids(self,
                              engine_id: str,
