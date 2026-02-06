@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 import uuid
+import os
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -361,7 +362,10 @@ class NixlConnectorWorker:
         self.block_size = vllm_config.cache_config.block_size
 
         # Config for nixl
-        config = nixl_agent_config(device_idx=get_tensor_model_parallel_rank(), backends=["UCCL"])
+        if os.getenv("UCCL_BACKEND") == "1":
+            config = nixl_agent_config(backends=["UCCL"])
+        else:
+            config = None
         # Agent.
         self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), config)
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
