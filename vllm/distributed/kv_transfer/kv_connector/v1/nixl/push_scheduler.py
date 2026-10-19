@@ -170,6 +170,17 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         )
         local_block_ids: BlockIds = blocks.get_unhashed_block_ids_all_groups()
         local_block_ids = self.get_exchange_clipped_blocks(local_block_ids)
+        # Blocks covered by the local prefix cache, per KV cache group, and the
+        # token count P will push. A producer whose cache groups differ from
+        # ours (HiSparse) pairs pages by token position with these, not by
+        # list length, which allocation padding on either side would shift.
+        local_num_computed_blocks = tuple(
+            sum(block.block_hash is not None and not block.is_null for block in group)
+            for group in blocks.blocks
+        )
+        num_tokens = self._get_remote_prefill_token_count(
+            len(request.prompt_token_ids or [])
+        )
 
         # ``remote_*`` fields are P's coordinates (from D's perspective).
         # ``decode_*`` fields are D's own info that P needs for the
@@ -186,6 +197,13 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             "remote_port": params["remote_port"],
             "remote_tp_size": params["tp_size"],
             "remote_pp_size": params.get("pp_size", 1),
+            "remote_dcp_size": params.get("dcp_size", 1),
+            "num_tokens": num_tokens,
+            # Indexed like ``local_block_ids``: transferable groups only.
+            "num_computed_blocks": [
+                local_num_computed_blocks[group_id]
+                for group_id in self.kv_cache_config.transfer_group_ids
+            ],
         }
         self._push_registration_deadlines[request.request_id] = (
             time.perf_counter() + self._push_registration_timeout
@@ -198,7 +216,14 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # ReqMeta without a KeyError — the actual remote block IDs are
         # learned by P over the NIXL handshake at WRITE time.
         params["remote_block_ids"] = ()
-        self._reqs_need_recv[request.request_id] = (request, local_block_ids, (), False)
+        # Lets the worker zero padding pages P does not write (region mapping).
+        params["remote_num_tokens"] = num_tokens
+        self._reqs_need_recv[request.request_id] = (
+            request,
+            local_block_ids,
+            local_num_computed_blocks,
+            False,
+        )
 
         # Mark as processed so a re-entry (e.g. preemption + reschedule)
         # doesn't re-stage the registration.
