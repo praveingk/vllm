@@ -1568,3 +1568,26 @@ def test_ring_scratch_without_mamba_registers_and_addresses_its_own_regions():
     )
     # Paged block 1 in both regions; ring block 0 only in its scratch region.
     assert sorted(desc_ids.tolist()) == sorted([0 * 2 + 1, 1 * 2 + 1, 1 * 2 + 0])
+
+
+@pytest.mark.cpu_test
+def test_push_compatibility_hash_ignores_peer_layout():
+    """A HiSparse consumer is packed (BLHNC) while its producer is not (LBHNC).
+    Layout is validated per region at handshake, so it must not split the
+    hash: both push peers hash the same order-free backend set."""
+    packed, _ = _make_packed_mla_view_worker(
+        {"L0": (0, 128)}, 128, backend_names=("INDEXER", "FLASHMLA")
+    )
+    assert packed._has_packed_cache
+    real_init = NixlPushConnectorWorker.__init__
+
+    def unpacked_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        self._has_packed_cache = False
+
+    with patch.object(NixlPushConnectorWorker, "__init__", unpacked_init):
+        unpacked, _ = _make_packed_mla_view_worker(
+            {"L0": (0, 128)}, 128, backend_names=("FLASHMLA", "INDEXER")
+        )
+    assert not unpacked._has_packed_cache
+    assert packed.compat_hash == unpacked.compat_hash
