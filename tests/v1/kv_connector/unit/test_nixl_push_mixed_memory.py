@@ -618,3 +618,19 @@ def test_duplicate_registrations_from_every_decode_rank_start_one_push(
     assert len(w.start_push_calls) == 1
     assert w._pending_d_registrations == {}
     assert w._started_push_reg_ids == {"req-abc-9999ffff": "req-abc-1234abcd"}
+
+
+@pytest.mark.parametrize("empty", [[], [[], []]])
+def test_decode_zeroing_tolerates_empty_recv(empty):
+    """A request aborted before scheduling (or a full local prefix hit) reaches
+    start_load_kv with no blocks; zeroing must not index into its groups."""
+    w = object.__new__(NixlPushConnectorWorker)
+    w.shutdown = lambda: None
+    w.region_group_ids = [0, 1]
+    meta = ReqMeta(
+        local_block_ids=empty,
+        local_physical_block_ids=empty,
+        tp_size=1,
+        remote=RemoteMeta([], "", 0, "P", "p-req", num_tokens=1508),
+    )
+    assert w._unwritten_region_blocks(meta) == [[], []]

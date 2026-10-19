@@ -272,6 +272,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         they are zeroed on completion (as the pull worker does after a
         region-mapped read).
         """
+        if not any(meta.local_physical_block_ids):
+            # Nothing allocated to receive into: a full local prefix hit, or the
+            # empty recv registered for a request aborted before scheduling.
+            return [[] for _ in self.region_group_ids]
         regions = self._block_ids_by_region(
             meta.local_physical_block_ids, self.region_group_ids
         )
