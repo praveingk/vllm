@@ -1397,8 +1397,11 @@ class NixlBaseConnectorWorker:
             is_mamba=self._has_mamba,
         )
         backend_name = self.backend_name
-        if self._supports_pp_hma and self._has_packed_cache:
-            # PP can reorder the same backends across stages of a packed model.
+        if self._supports_pp_hma:
+            # PP can reorder the same backends across stages of a packed model,
+            # and push peers may differ in layout (a HiSparse consumer is packed,
+            # its producer is not), which the handshake validates per region.
+            # Hash the order-free backend set so neither changes the hash.
             backend_name = ",".join(
                 sorted({backend.get_name() for backend in self.attn_backends})
             )
