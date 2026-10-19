@@ -380,9 +380,18 @@ class NixlPushConnector(NixlBaseConnector):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, role, kv_cache_config)
-        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+        # A DCP-sharded producer pushes its token slice into an unsharded
+        # consumer. A sharded consumer would need every producer rank to split
+        # its WRITE across consumer shards.
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        if (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+            and kv_transfer_config.is_kv_consumer
+        ):
             raise ValueError(
-                "NixlPushConnector does not support decode_context_parallel_size > 1."
+                "NixlPushConnector consumer (decode) does not support "
+                "decode_context_parallel_size > 1."
             )
         self.connector_scheduler: NixlPushConnectorScheduler | None = None
         self.connector_worker: NixlPushConnectorWorker | None = None

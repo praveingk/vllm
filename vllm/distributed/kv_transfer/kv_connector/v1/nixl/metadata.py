@@ -50,8 +50,10 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  12: Add per-region member names for PP push
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add Qwen3.8-Flash-Next PLE page length - #59997
+#  15: Advertise ranks that leave their DRAM regions to TP rank 0 (push into a
+#      shared HiSparse host pool)
 #
-NIXL_CONNECTOR_VERSION: int = 14
+NIXL_CONNECTOR_VERSION: int = 15
 
 
 @dataclass
@@ -80,6 +82,9 @@ class NixlAgentMetadata:
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # This rank's DRAM regions are a host pool shared with TP rank 0, which
+    # alone registers them with NIXL, so a push producer must not WRITE them here.
+    skips_dram_xfer: bool = False
 
 
 @dataclass
@@ -236,6 +241,8 @@ class RemoteMeta:
     request_id: str
     blocks_expiry_time: float | None = None
     num_tokens: int | None = None
+    # Push (P side): the consumer's prefix-cache hit per transferable group.
+    num_computed_blocks: tuple[int, ...] = ()
 
 
 @dataclass

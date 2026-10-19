@@ -326,6 +326,28 @@ def test_per_request_spec_decode_metrics_requires_spec_decode():
                 ]
             },
         ),
+        # A DCP-sharded push producer WRITEs whole blocks per shard, so it
+        # needs block-level interleave just like a pull peer.
+        KVTransferConfig(
+            kv_connector="NixlPushConnector",
+            kv_role="kv_producer",
+        ),
+        KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "NixlPushConnector",
+                        "kv_role": "kv_producer",
+                    },
+                    {
+                        "kv_connector": "OffloadingConnector",
+                        "kv_role": "kv_both",
+                    },
+                ]
+            },
+        ),
     ],
 )
 def test_pd_dcp_interleave_size_is_adjusted_to_block_size(

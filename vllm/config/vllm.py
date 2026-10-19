@@ -1471,9 +1471,9 @@ class VllmConfig:
         self._verify_trace_replay_config()
 
         # A NIXL side is either fully replicated or fully DCP-sharded; MLA only.
-        if (
-            self.kv_transfer_config is not None
-            and self.kv_transfer_config.has_connector("NixlConnector")
+        if self.kv_transfer_config is not None and any(
+            self.kv_transfer_config.has_connector(name)
+            for name in ("NixlConnector", "NixlPushConnector")
         ):
             dcp_size = self.parallel_config.decode_context_parallel_size
             transfer_tp_size = max(
@@ -3226,8 +3226,9 @@ class VllmConfig:
                 "deprecated when PCP is fully supported."
             )
 
-        if self.kv_transfer_config is None or not self.kv_transfer_config.has_connector(
-            "NixlConnector"
+        if self.kv_transfer_config is None or not any(
+            self.kv_transfer_config.has_connector(name)
+            for name in ("NixlConnector", "NixlPushConnector")
         ):
             return
         if not self.parallel_config._allow_auto_resolve_cp_interleave_size:
@@ -3261,9 +3262,9 @@ class VllmConfig:
 
         # Skip DCP interleave-size compatibility for NIXL P/D: the interleave
         # size is pinned to block_size by each worker.
-        nixl_pd_active = (
-            self.kv_transfer_config is not None
-            and self.kv_transfer_config.has_connector("NixlConnector")
+        nixl_pd_active = self.kv_transfer_config is not None and any(
+            self.kv_transfer_config.has_connector(name)
+            for name in ("NixlConnector", "NixlPushConnector")
         )
         if self.parallel_config.decode_context_parallel_size > 1 and not nixl_pd_active:
             assert (

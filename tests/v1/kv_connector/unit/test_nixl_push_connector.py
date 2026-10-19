@@ -112,8 +112,19 @@ def _make_request(
 class _BlocksMock:
     """Minimal stand-in for ``KVCacheBlocks`` used in update_state_after_alloc."""
 
-    def __init__(self, block_ids: tuple[list[int], ...]):
+    def __init__(self, block_ids: tuple[list[int], ...], num_cached: int = 0):
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
         self._block_ids = block_ids
+        # ``num_cached`` hashed (prefix-cache hit) blocks lead each group.
+        self.blocks = tuple(
+            [
+                KVCacheBlock(block_id=-1 - i, _block_hash=b"cached")
+                for i in range(num_cached)
+            ]
+            + [KVCacheBlock(block_id=block_id) for block_id in group]
+            for group in block_ids
+        )
 
     def get_unhashed_block_ids_all_groups(self) -> tuple[list[int], ...]:
         return self._block_ids
@@ -349,8 +360,11 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._sending_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         w._send_failures = set()
         w._sending_transfers_lock = threading.Lock()
+        w._pending_push_notifs = {}
+        w._pending_push_notifs_staged = []
         w._push_finished_blocks = {}
         w._pending_d_registrations = {}
+        w._started_push_reg_ids = {}
         w._reg_send_inbox = queue.Queue()
         w._finished_blocks_inbox = queue.Queue()
         w._pending_completion_notifs = queue.Queue()
@@ -376,6 +390,9 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w.pcp_rank = 0
         w.pcp_dcp_sharded = False
         w.world_size = 1
+        w.transfer_tp_size = 1
+        w.dcp_size = 1
+        w.dcp_rank = 0
         w.pp_size = 1
         w.engine_id = "test-decode-engine"
         w._remote_agents = {}
@@ -392,6 +409,10 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w.dst_region_group_ids = {}
         w.dst_uses_region_group_mapping = {}
         w.dst_region_mem_types = {}
+        w._dst_dram_xfer_side_handles = defaultdict(dict)
+        w._dst_desc_is_dram = {}
+        w._dst_desc_pos = {}
+        w._mixed_mem_types = False
         # Single non-hybrid attention group, matching the stub block id lists.
         w._has_mamba = False
         w._is_csa_linear = False
@@ -923,7 +944,7 @@ class TestPushWriterNotifs:
         # Pretend the writer thread already forwarded a completion notif
         # for a request whose KV is being received.
         request_id = "req-recv-1"
-        w._recving_metadata[request_id] = MagicMock(pp_size=1)
+        w._recving_metadata[request_id] = MagicMock(pp_size=1, dcp_size=1)
         # Compose the standard completion notif: req_id:tp_size.
         notif_msg = f"{request_id}:1".encode()
         w._pending_completion_notifs.put(notif_msg)
@@ -1422,7 +1443,7 @@ class TestPushPipelineParallel:
         w = _StubWriterWorker.fresh()
         w.transfer_topo = MagicMock()
         request_id = "req-pp-2"
-        w._recving_metadata[request_id] = MagicMock(pp_size=2)
+        w._recving_metadata[request_id] = MagicMock(pp_size=2, dcp_size=1)
         notif = f"{request_id}:1".encode()
 
         # First stage: counted, not yet done.
@@ -1596,7 +1617,7 @@ class TestPushWriterMlaReplication:
 
         engine_id = "decode-engine"
         w = _StubWriterWorker.fresh()
-        w.world_size = 2
+        w.world_size = w.transfer_tp_size = 2
         w.use_mla = False
         w._has_mamba = True
         w._is_csa_linear = True

@@ -791,6 +791,13 @@ class NixlBaseConnectorWorker:
         self._dram_src_handles_by_tp_ratio: dict[tuple[int, int], list[int | None]] = {}
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
+        # Push to a mixed-memory consumer: remote DRAM descriptors live in their
+        # own dlist (dst_xfer_side_handles then holds only the device part).
+        self._dst_dram_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
+        # Per remote descriptor id: whether it is DRAM, and its index within the
+        # dlist of its memory type.
+        self._dst_desc_is_dram: dict[EngineId, np.ndarray] = {}
+        self._dst_desc_pos: dict[EngineId, np.ndarray] = {}
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -1014,9 +1021,7 @@ class NixlBaseConnectorWorker:
         # local rank will read from. Note that With homogeneous TP,
         # this happens to be the same single rank_i.
         assert self.transfer_topo is not None
-        p_remote_ranks = self.transfer_topo.handshake_target_ranks(
-            remote_tp_size, remote_dcp_size
-        )
+        p_remote_ranks = self._handshake_target_ranks(remote_tp_size, remote_dcp_size)
         remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
         path = make_zmq_path("tcp", host, port)
         # Clock offset to the peer, estimated from the handshake round-trip.
@@ -1263,6 +1268,15 @@ class NixlBaseConnectorWorker:
             context,
             exc_info=error is not None,
             stacklevel=2,
+        )
+
+    def _handshake_target_ranks(
+        self, remote_tp_size: int, remote_dcp_size: int
+    ) -> list[int]:
+        """Remote TP ranks this rank handshakes with."""
+        assert self.transfer_topo is not None
+        return self.transfer_topo.handshake_target_ranks(
+            remote_tp_size, remote_dcp_size
         )
 
     def _ensure_handshake(
@@ -1803,6 +1817,7 @@ class NixlBaseConnectorWorker:
             pcp_size=self.pcp_size,
             region_members=self.region_members,
             packed_member_layouts=packed_member_layouts,
+            skips_dram_xfer=self._skip_dram_xfer,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2399,15 +2414,101 @@ class NixlBaseConnectorWorker:
 
         remote_mem_types = set(self.dst_region_mem_types[engine_id])
         if len(remote_mem_types) != 1:
-            raise NotImplementedError(
-                "NIXL pull does not yet support a mixed-memory producer"
+            self._register_mixed_remote_xfer_handles(
+                engine_id,
+                remote_tp_rank,
+                remote_agent_name,
+                blocks_data,
+                nixl_agent_meta.skips_dram_xfer,
             )
+            return remote_agent_name
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, remote_mem_types.pop())
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
 
         return remote_agent_name
+
+    def _register_mixed_remote_xfer_handles(
+        self,
+        engine_id: EngineId,
+        remote_tp_rank: int,
+        remote_agent_name: str,
+        blocks_data: np.ndarray,
+        remote_skips_dram_xfer: bool,
+    ) -> None:
+        """Split a mixed-memory consumer's descriptors into per-memory dlists.
+
+        Only a push producer WRITEs into a mixed-memory remote (a HiSparse
+        decode). A NIXL dlist holds one memory type, so the remote DRAM
+        descriptors get their own handle and ``_dst_desc_pos`` maps each
+        remote descriptor id to its position within its type's dlist.
+
+        A remote rank that shares its host pool with TP rank 0 did not register
+        its DRAM regions, so it gets no DRAM handle: rank 0 receives that part.
+        """
+        if self._TRANSFER_MODE != "push":
+            raise NotImplementedError(
+                "NIXL pull does not yet support a mixed-memory producer"
+            )
+        if self._has_mamba:
+            raise NotImplementedError(
+                "Mixed-memory push supports MLA models without Mamba layers only."
+            )
+        assert self.transfer_topo is not None
+        block_size_ratio = self.transfer_topo.block_size_ratio(
+            self.transfer_topo.get_engine_info(engine_id).remote_block_size
+        )
+        if block_size_ratio != 1:
+            raise NotImplementedError(
+                "Mixed-memory push requires matching P/D block sizes, got ratio "
+                f"{block_size_ratio}."
+            )
+        remote_region_num_blocks = self.dst_region_num_blocks[engine_id]
+        desc_is_dram = np.concatenate(
+            [
+                np.full(count, mem_type == "DRAM", dtype=bool)
+                for mem_type, count in zip(
+                    self.dst_region_mem_types[engine_id],
+                    remote_region_num_blocks,
+                    strict=True,
+                )
+            ]
+        )
+        assert len(desc_is_dram) == len(blocks_data), (
+            f"{len(desc_is_dram)} remote memory flags for {len(blocks_data)} descs"
+        )
+        desc_pos = np.empty(len(desc_is_dram), dtype=np.int64)
+        dram_idx = np.flatnonzero(desc_is_dram)
+        device_idx = np.flatnonzero(~desc_is_dram)
+        desc_pos[dram_idx] = np.arange(len(dram_idx), dtype=np.int64)
+        desc_pos[device_idx] = np.arange(len(device_idx), dtype=np.int64)
+        self._dst_desc_is_dram[engine_id] = desc_is_dram
+        self._dst_desc_pos[engine_id] = desc_pos
+
+        blocks_data = np.array(blocks_data, dtype=np.uint64)
+        # DRAM descriptors are registered under CPU device 0 on the remote.
+        blocks_data[dram_idx, 2] = 0
+        remote_device_types = set(self.dst_region_mem_types[engine_id]) - {"DRAM"}
+        assert len(remote_device_types) == 1, remote_device_types
+        if not remote_skips_dram_xfer:
+            dram_descs = self.nixl_wrapper.get_xfer_descs(blocks_data[dram_idx], "DRAM")
+            self._dst_dram_xfer_side_handles[engine_id][remote_tp_rank] = (
+                self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, dram_descs)
+            )
+        device_descs = self.nixl_wrapper.get_xfer_descs(
+            blocks_data[device_idx], remote_device_types.pop()
+        )
+        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, device_descs)
+        )
+
+    def _release_mixed_remote_xfer_handles(self, engine_id: EngineId) -> None:
+        """Drop the DRAM dlists and descriptor maps of a mixed-memory remote."""
+        for handle in self._dst_dram_xfer_side_handles.pop(engine_id, {}).values():
+            self.nixl_wrapper.release_dlist_handle(handle)
+        self._dst_desc_is_dram.pop(engine_id, None)
+        self._dst_desc_pos.pop(engine_id, None)
 
     def _validate_remote_agent_handshake(
         self,
@@ -3688,6 +3789,7 @@ class NixlBaseConnectorWorker:
         # Notif-only engines (push-mode D side) have no descriptor state.
         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
             self.nixl_wrapper.release_dlist_handle(handle)
+        self._release_mixed_remote_xfer_handles(engine_id)
         # Pop under the handshake lock; NIXL teardown stays outside it.
         with self._handshake_lock:
             agents = self._remote_agents.pop(engine_id)
